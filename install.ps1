@@ -59,6 +59,26 @@ function Assert-Admin {
     }
 }
 
+# Runs a native command (git, uv, winget, etc.) without triggering PowerShell's
+# "NativeCommandError" behaviour on stderr writes. Checks $LASTEXITCODE and
+# throws on non-zero. Pass the command as a script block.
+function Invoke-NativeCommand {
+    param(
+        [Parameter(Mandatory)][string]$Description,
+        [Parameter(Mandatory)][scriptblock]$ScriptBlock
+    )
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        & $ScriptBlock 2>&1 | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            throw "$Description failed (exit code $LASTEXITCODE). See output above for details."
+        }
+    } finally {
+        $ErrorActionPreference = $prev
+    }
+}
+
 # ---------- Banner ------------------------------------------------
 
 Write-Host ""
@@ -95,7 +115,9 @@ if (Test-Cmd python) {
 }
 if (-not $pythonOk) {
     Write-Info "Installing Python 3.12 via winget..."
-    winget install -e --id Python.Python.3.12 --silent --accept-source-agreements --accept-package-agreements
+    Invoke-NativeCommand "winget install Python" {
+        winget install -e --id Python.Python.3.12 --silent --accept-source-agreements --accept-package-agreements
+    }
     Update-SessionPath
     if (-not (Test-Cmd python)) {
         Write-Host "Python installed but not yet on PATH in this window." -ForegroundColor Red
@@ -112,7 +134,9 @@ if (Test-Cmd git) {
     Write-Ok "Git already installed"
 } else {
     Write-Info "Installing Git via winget..."
-    winget install -e --id Git.Git --silent --accept-source-agreements --accept-package-agreements
+    Invoke-NativeCommand "winget install Git" {
+        winget install -e --id Git.Git --silent --accept-source-agreements --accept-package-agreements
+    }
     Update-SessionPath
     if (-not (Test-Cmd git)) {
         Write-Host "Git installed but not yet on PATH. Restart PowerShell as admin and re-run." -ForegroundColor Red
@@ -143,12 +167,15 @@ Write-Step "Getting the Pipedrive MCP code"
 if (Test-Path $InstallPath) {
     Write-Info "Folder already exists at $InstallPath -- pulling latest changes..."
     Push-Location $InstallPath
-    git pull origin main 2>&1 | Out-Null
-    Pop-Location
+    try {
+        Invoke-NativeCommand "git pull" { git pull origin main --quiet }
+    } finally {
+        Pop-Location
+    }
     Write-Ok "Updated $InstallPath"
 } else {
     Write-Info "Cloning to $InstallPath..."
-    git clone $RepoUrl $InstallPath 2>&1 | Out-Null
+    Invoke-NativeCommand "git clone" { git clone --quiet $RepoUrl $InstallPath }
     Write-Ok "Cloned to $InstallPath"
 }
 
@@ -156,19 +183,34 @@ if (Test-Path $InstallPath) {
 
 Write-Step "Installing Python dependencies (this takes 1-2 minutes)"
 Push-Location $InstallPath
-uv sync 2>&1 | Out-Null
-Pop-Location
+try {
+    Invoke-NativeCommand "uv sync" { uv sync }
+} finally {
+    Pop-Location
+}
 Write-Ok "Dependencies installed"
 
 # ---------- Step 6: Prompt for API token -------------------------
 
 Write-Step "Pipedrive API token"
-Write-Info "Get your personal API token (each teammate needs their own):"
-Write-Info "  1. Sign in at aventis-advisors.pipedrive.com"
-Write-Info "  2. Profile picture (top-right) -> Personal preferences"
-Write-Info "  3. API tab -> Generate new token -> copy the value"
+Write-Info "You need a personal Pipedrive API token. Each teammate uses their own --"
+Write-Info "do NOT share tokens, and do NOT reuse someone else's."
 Write-Host ""
-$secureToken = Read-Host "Paste your Pipedrive API token" -AsSecureString
+Write-Info "How to get your token:"
+Write-Info "  1. In your web browser, open:  https://aventis-advisors.pipedrive.com"
+Write-Info "  2. Sign in to Pipedrive."
+Write-Info "  3. Click your profile picture in the top-right corner."
+Write-Info "  4. In the dropdown, click 'Personal preferences'."
+Write-Info "  5. Click the 'API' tab (may be under a 'More' menu on narrow windows)."
+Write-Info "  6. If an existing token is shown, click 'Revoke' first, then 'Generate new token'."
+Write-Info "     Otherwise, just click 'Generate new token'."
+Write-Info "  7. Copy the long string of letters and numbers it shows you."
+Write-Host ""
+Write-Warn "SECURITY: treat this token like a password. When you paste it below,"
+Write-Warn "nothing will appear on your screen -- that is intentional, not a bug."
+Write-Warn "Just paste (Ctrl+V or right-click) and press Enter."
+Write-Host ""
+$secureToken = Read-Host "Paste your Pipedrive API token here" -AsSecureString
 $token = [System.Net.NetworkCredential]::new("", $secureToken).Password
 if ([string]::IsNullOrWhiteSpace($token)) {
     Write-Host "ERROR: No token entered. Aborting." -ForegroundColor Red
@@ -212,7 +254,8 @@ FEATURE_CONFIG_PATH=
 LOG_LEVEL=INFO
 "@
 $envPath = Join-Path $InstallPath ".env"
-$envContent | Out-File -FilePath $envPath -Encoding UTF8
+# Write as UTF-8 WITHOUT BOM (the BOM breaks some parsers / tools).
+[System.IO.File]::WriteAllText($envPath, $envContent, [System.Text.UTF8Encoding]::new($false))
 Write-Ok ".env written at $envPath"
 
 # ---------- Step 8: Merge Claude Desktop config ------------------
@@ -227,7 +270,8 @@ if (-not (Test-Path $configDir)) {
 $config = $null
 if (Test-Path $ClaudeConfigPath) {
     try {
-        $raw = Get-Content $ClaudeConfigPath -Raw -ErrorAction Stop
+        # Use .NET ReadAllText: handles UTF-8 BOM correctly (strips it).
+        $raw = [System.IO.File]::ReadAllText($ClaudeConfigPath)
         if ([string]::IsNullOrWhiteSpace($raw)) {
             $config = @{}
             Write-Info "Existing config was empty -- starting fresh"
@@ -260,7 +304,10 @@ $config.mcpServers.pipedrive = @{
     args    = @("--directory", $InstallPath, "run", "server.py")
 }
 
-$config | ConvertTo-Json -Depth 10 | Set-Content -Path $ClaudeConfigPath -Encoding UTF8
+$jsonOut = $config | ConvertTo-Json -Depth 10
+# Write as UTF-8 WITHOUT BOM. Claude Desktop's parser rejects files that start
+# with the UTF-8 BOM (0xEF 0xBB 0xBF), producing "Unexpected token" errors.
+[System.IO.File]::WriteAllText($ClaudeConfigPath, $jsonOut, [System.Text.UTF8Encoding]::new($false))
 Write-Ok "Pipedrive entry written to $ClaudeConfigPath"
 
 # ---------- Done -------------------------------------------------
