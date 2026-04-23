@@ -1,4 +1,5 @@
 import inspect
+import os
 import re
 from typing import Callable, Dict, List, Optional, Any, Set, Tuple
 from functools import wraps
@@ -6,6 +7,19 @@ from functools import wraps
 from log_config import logger
 from pipedrive.api.features.tool_registry import registry
 from pipedrive.mcp_instance import mcp
+
+
+# Tools whose names start with one of these prefixes are treated as read-only.
+# Anything else (create_, update_, delete_, add_, etc.) is considered a write
+# operation and is hidden from Claude when PIPEDRIVE_READ_ONLY is enabled.
+READ_TOOL_PREFIXES = ("get_", "list_", "search_")
+
+
+def _is_read_only_mode() -> bool:
+    """Return True when PIPEDRIVE_READ_ONLY is set to a truthy value."""
+    return os.getenv("PIPEDRIVE_READ_ONLY", "false").lower() in (
+        "true", "1", "yes", "y", "on"
+    )
 
 
 def validate_docstring(func: Callable, feature_id: str) -> List[str]:
@@ -93,6 +107,15 @@ def tool(feature_id: str, validate: bool = True):
         Decorator function for tool
     """
     def decorator(func: Callable) -> Callable:
+        # Read-only mode: if PIPEDRIVE_READ_ONLY=true, skip registration for any
+        # tool that isn't clearly a read operation (get_/list_/search_). Tools
+        # that are not registered with MCP are invisible to Claude at runtime.
+        if _is_read_only_mode() and not func.__name__.startswith(READ_TOOL_PREFIXES):
+            logger.info(
+                f"Read-only mode: skipping registration of write tool '{func.__name__}'"
+            )
+            return func
+
         # Validate docstring if requested
         if validate:
             warnings = validate_docstring(func, feature_id)
