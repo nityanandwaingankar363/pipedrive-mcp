@@ -89,6 +89,36 @@ Write-Host "==================================================" -ForegroundColor
 
 Assert-Admin
 
+# ---------- Check: Claude Desktop must be fully quit --------------
+
+$claudeProc = Get-Process -Name "Claude" -ErrorAction SilentlyContinue
+if ($claudeProc) {
+    Write-Host ""
+    Write-Warn "Claude Desktop is currently running."
+    Write-Warn "It must be fully quit before we continue -- otherwise file locks will"
+    Write-Warn "block the installation."
+    Write-Host ""
+    Write-Info "How to fully quit Claude Desktop:"
+    Write-Info "  1. Look at the system tray (bottom-right of screen, near the clock)."
+    Write-Info "     Click the small up-arrow (^) if you don't see the Claude icon."
+    Write-Info "  2. Right-click the Claude icon."
+    Write-Info "  3. Click 'Quit' (not just closing the window)."
+    Write-Host ""
+    $answer = Read-Host "Press Enter when Claude Desktop is fully closed (or type 'cancel' to abort)"
+    if ($answer -eq 'cancel') {
+        Write-Host "Aborted." -ForegroundColor Yellow
+        exit 0
+    }
+    Start-Sleep -Seconds 1
+    if (Get-Process -Name "Claude" -ErrorAction SilentlyContinue) {
+        Write-Warn "Claude Desktop still appears to be running. Proceeding anyway, but"
+        Write-Warn "you may encounter file-lock errors below. If so, fully quit Claude"
+        Write-Warn "Desktop and re-run this script."
+    } else {
+        Write-Ok "Claude Desktop is fully quit."
+    }
+}
+
 # ---------- Configuration ----------------------------------------
 
 $RepoUrl          = "https://github.com/nityanandwaingankar363/pipedrive-mcp.git"
@@ -164,19 +194,50 @@ if (Test-Cmd uv) {
 # ---------- Step 4: Clone / update repo --------------------------
 
 Write-Step "Getting the Pipedrive MCP code"
-if (Test-Path $InstallPath) {
-    Write-Info "Folder already exists at $InstallPath -- pulling latest changes..."
-    Push-Location $InstallPath
+
+# If the folder exists but isn't a real git repo (e.g. half-deleted from a
+# previous failed run), remove it so we can re-clone from scratch.
+if ((Test-Path $InstallPath) -and (-not (Test-Path (Join-Path $InstallPath ".git")))) {
+    Write-Warn "Folder exists at $InstallPath but is not a git repo (corrupt from a previous run). Removing..."
     try {
-        Invoke-NativeCommand "git pull" { git pull origin main --quiet }
-    } finally {
-        Pop-Location
+        Remove-Item -Recurse -Force $InstallPath -ErrorAction Stop
+    } catch {
+        Write-Host "Could not remove $InstallPath -- files may still be locked by Claude Desktop." -ForegroundColor Red
+        Write-Host "Fully quit Claude Desktop and re-run this script." -ForegroundColor Red
+        throw
     }
-    Write-Ok "Updated $InstallPath"
-} else {
+}
+
+if (-not (Test-Path $InstallPath)) {
     Write-Info "Cloning to $InstallPath..."
     Invoke-NativeCommand "git clone" { git clone --quiet $RepoUrl $InstallPath }
     Write-Ok "Cloned to $InstallPath"
+} else {
+    Write-Info "Folder already exists at $InstallPath -- pulling latest changes..."
+    $pullFailed = $false
+    Push-Location $InstallPath
+    try {
+        Invoke-NativeCommand "git pull" { git pull origin main --quiet }
+    } catch {
+        $pullFailed = $true
+        Write-Warn "git pull failed. Will try a fresh clone as recovery."
+    } finally {
+        Pop-Location
+    }
+
+    if ($pullFailed) {
+        try {
+            Remove-Item -Recurse -Force $InstallPath -ErrorAction Stop
+            Invoke-NativeCommand "git clone" { git clone --quiet $RepoUrl $InstallPath }
+            Write-Ok "Re-cloned to $InstallPath"
+        } catch {
+            Write-Host "Could not recover. The local folder is still in a bad state." -ForegroundColor Red
+            Write-Host "Fully quit Claude Desktop, manually delete $InstallPath, then re-run this script." -ForegroundColor Red
+            throw
+        }
+    } else {
+        Write-Ok "Updated $InstallPath"
+    }
 }
 
 # ---------- Step 5: Python deps ----------------------------------
